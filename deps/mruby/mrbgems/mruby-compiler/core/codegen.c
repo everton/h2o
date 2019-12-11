@@ -62,7 +62,7 @@ typedef struct scope {
 
   struct loopinfo *loop;
   int ensure_level;
-  char const *filename;
+  mrb_sym filename_sym;
   uint16_t lineno;
 
   mrb_code *iseq;
@@ -102,12 +102,14 @@ codegen_error(codegen_scope *s, const char *message)
   while (s->prev) {
     codegen_scope *tmp = s->prev;
     mrb_free(s->mrb, s->iseq);
+    mrb_free(s->mrb, s->lines);
     mrb_pool_close(s->mpool);
     s = tmp;
   }
 #ifndef MRB_DISABLE_STDIO
-  if (s->filename && s->lineno) {
-    fprintf(stderr, "codegen error:%s:%d: %s\n", s->filename, s->lineno, message);
+  if (s->filename_sym && s->lineno) {
+    const char *filename = mrb_sym_name_len(s->mrb, s->filename_sym, NULL);
+    fprintf(stderr, "codegen error:%s:%d: %s\n", filename, s->lineno, message);
   }
   else {
     fprintf(stderr, "codegen error: %s\n", message);
@@ -271,8 +273,7 @@ genop_W(codegen_scope *s, mrb_code i, uint32_t a)
 #define NOVAL  0
 #define VAL    1
 
-//static
-mrb_bool
+static mrb_bool
 no_optimize(codegen_scope *s)
 {
   if (s && s->parser && s->parser->no_optimize)
@@ -290,7 +291,7 @@ on_eval(codegen_scope *s)
 }
 
 struct mrb_insn_data
-mrb_decode_insn(mrb_code *pc)
+mrb_decode_insn(const mrb_code *pc)
 {
   struct mrb_insn_data data = { 0 };
   mrb_code insn = READ_B();
@@ -558,7 +559,7 @@ new_lit(codegen_scope *s, mrb_value val)
       mrb_int len;
       pv = &s->irep->pool[i];
 
-      if (mrb_type(*pv) != MRB_TT_STRING) continue;
+      if (!mrb_string_p(*pv)) continue;
       if ((len = RSTRING_LEN(*pv)) != RSTRING_LEN(val)) continue;
       if (memcmp(RSTRING_PTR(*pv), RSTRING_PTR(val), len) == 0)
         return i;
@@ -569,7 +570,7 @@ new_lit(codegen_scope *s, mrb_value val)
     for (i=0; i<s->irep->plen; i++) {
       mrb_float f1, f2;
       pv = &s->irep->pool[i];
-      if (mrb_type(*pv) != MRB_TT_FLOAT) continue;
+      if (!mrb_float_p(*pv)) continue;
       f1 = mrb_float(*pv);
       f2 = mrb_float(val);
       if (f1 == f2 && !signbit(f1) == !signbit(f2)) return i;
@@ -685,9 +686,6 @@ for_body(codegen_scope *s, node *tree)
   codegen(s, tree->cdr->car, VAL);
   /* generate loop-block */
   s = scope_new(s->mrb, s, NULL);
-  if (s == NULL) {
-    raise_error(prev, "unexpected scope");
-  }
 
   push();                       /* push for a block parameter */
 
@@ -723,9 +721,6 @@ lambda_body(codegen_scope *s, node *tree, int blk)
 {
   codegen_scope *parent = s;
   s = scope_new(s->mrb, s, tree->car);
-  if (s == NULL) {
-    raise_error(parent, "unexpected scope");
-  }
 
   s->mscope = !blk;
 
@@ -823,8 +818,8 @@ lambda_body(codegen_scope *s, node *tree, int blk)
         mrb_assert(nint(kwd->car) == NODE_KW_ARG);
 
         if (def_arg) {
-          genop_2(s, OP_KEY_P, cursp(), new_sym(s, kwd_sym));
-          jmpif_key_p = genjmp2(s, OP_JMPIF, cursp(), 0, 0);
+          genop_2(s, OP_KEY_P, lv_idx(s, kwd_sym), new_sym(s, kwd_sym));
+          jmpif_key_p = genjmp2(s, OP_JMPIF, lv_idx(s, kwd_sym), 0, 0);
           codegen(s, def_arg, VAL);
           pop();
           gen_move(s, lv_idx(s, kwd_sym), cursp(), 0);
@@ -887,9 +882,6 @@ static int
 scope_body(codegen_scope *s, node *tree, int val)
 {
   codegen_scope *scope = scope_new(s->mrb, s, tree->car);
-  if (scope == NULL) {
-    codegen_error(s, "unexpected scope");
-  }
 
   codegen(scope, tree->cdr, VAL);
   gen_return(scope, OP_RETURN, scope->sp-1);
@@ -921,7 +913,7 @@ attrsym(codegen_scope *s, mrb_sym a)
   mrb_int len;
   char *name2;
 
-  name = mrb_sym2name_len(s->mrb, a, &len);
+  name = mrb_sym_name_len(s->mrb, a, &len);
   name2 = (char *)codegen_palloc(s,
                                  (size_t)len
                                  + 1 /* '=' */
@@ -955,7 +947,12 @@ gen_values(codegen_scope *s, node *t, int val, int extra)
         }
         else {
           pop_n(n);
-          genop_2(s, OP_ARRAY, cursp(), n);
+          if (n == 0 && is_splat) {
+            genop_1(s, OP_LOADNIL, cursp());
+          }
+          else {
+            genop_2(s, OP_ARRAY, cursp(), n);
+          }
           push();
           codegen(s, t->car, VAL);
           pop(); pop();
@@ -1040,7 +1037,7 @@ gen_call(codegen_scope *s, node *tree, mrb_sym name, int sp, int val, int safe)
   pop_n(n+1);
   {
     mrb_int symlen;
-    const char *symname = mrb_sym2name_len(s->mrb, sym, &symlen);
+    const char *symname = mrb_sym_name_len(s->mrb, sym, &symlen);
 
     if (!noop && symlen == 1 && symname[0] == '+' && n == 1)  {
       gen_addsub(s, OP_ADD, cursp());
@@ -1399,13 +1396,14 @@ codegen(codegen_scope *s, node *tree, int val)
     codegen_error(s, "too complex expression");
   }
   if (s->irep && s->filename_index != tree->filename_index) {
-    const char *filename = mrb_parser_get_filename(s->parser, s->filename_index);
+    mrb_sym fname = mrb_parser_get_filename(s->parser, s->filename_index);
+    const char *filename = mrb_sym_name_len(s->mrb, fname, NULL);
 
     mrb_debug_info_append_file(s->mrb, s->irep->debug_info,
                                filename, s->lines, s->debug_start_pos, s->pc);
     s->debug_start_pos = s->pc;
     s->filename_index = tree->filename_index;
-    s->filename = mrb_parser_get_filename(s->parser, tree->filename_index);
+    s->filename_sym = mrb_parser_get_filename(s->parser, tree->filename_index);
   }
 
   nt = nint(tree->car);
@@ -1551,7 +1549,7 @@ codegen(codegen_scope *s, node *tree, int val)
 
   case NODE_IF:
     {
-      int pos1, pos2;
+      int pos1, pos2, nil_p = FALSE;
       node *elsepart = tree->cdr->cdr->car;
 
       if (!tree->car) {
@@ -1568,30 +1566,57 @@ codegen(codegen_scope *s, node *tree, int val)
       case NODE_NIL:
         codegen(s, elsepart, val);
         goto exit;
+      case NODE_CALL:
+        {
+          node *n = tree->car->cdr;
+          mrb_sym mid = nsym(n->cdr->car);
+          mrb_sym mnil = mrb_intern_lit(s->mrb, "nil?");
+          if (mid == mnil && n->cdr->cdr->car == NULL) {
+            nil_p = TRUE;
+            codegen(s, n->car, VAL);
+          }
+        }
+        break;
       }
-      codegen(s, tree->car, VAL);
+      if (!nil_p) {
+        codegen(s, tree->car, VAL);
+      }
       pop();
-      pos1 = genjmp2(s, OP_JMPNOT, cursp(), 0, val);
-
-      codegen(s, tree->cdr->car, val);
-      if (elsepart) {
+      if (val || tree->cdr->car) {
+        if (nil_p) {
+          pos2 = genjmp2(s, OP_JMPNIL, cursp(), 0, val);
+          pos1 = genjmp(s, OP_JMP, 0);
+          dispatch(s, pos2);
+        }
+        else {
+          pos1 = genjmp2(s, OP_JMPNOT, cursp(), 0, val);
+        }
+        codegen(s, tree->cdr->car, val);
         if (val) pop();
-        pos2 = genjmp(s, OP_JMP, 0);
-        dispatch(s, pos1);
-        codegen(s, elsepart, val);
-        dispatch(s, pos2);
-      }
-      else {
-        if (val) {
-          pop();
+        if (elsepart || val) {
           pos2 = genjmp(s, OP_JMP, 0);
           dispatch(s, pos1);
-          genop_1(s, OP_LOADNIL, cursp());
+          codegen(s, elsepart, val);
           dispatch(s, pos2);
-          push();
         }
         else {
           dispatch(s, pos1);
+        }
+      }
+      else {                    /* empty then-part */
+        if (elsepart) {
+          if (nil_p) {
+            pos1 = genjmp2(s, OP_JMPNIL, cursp(), 0, val);
+          }
+          else {
+            pos1 = genjmp2(s, OP_JMPIF, cursp(), 0, val);
+          }
+          codegen(s, elsepart, val);
+          dispatch(s, pos1);
+        }
+        else if (val && !nil_p) {
+          genop_1(s, OP_LOADNIL, cursp());
+          push();
         }
       }
     }
@@ -1953,7 +1978,7 @@ codegen(codegen_scope *s, node *tree, int val)
     {
       mrb_sym sym = nsym(tree->cdr->car);
       mrb_int len;
-      const char *name = mrb_sym2name_len(s->mrb, sym, &len);
+      const char *name = mrb_sym_name_len(s->mrb, sym, &len);
       int idx, callargs = -1, vsp = -1;
 
       if ((len == 2 && name[0] == '|' && name[1] == '|') &&
@@ -2351,10 +2376,6 @@ codegen(codegen_scope *s, node *tree, int val)
     }
     break;
 
-  case NODE_DEFINED:
-    codegen(s, tree, val);
-    break;
-
   case NODE_BACK_REF:
     if (val) {
       char buf[] = {'$', nchar(tree)};
@@ -2371,7 +2392,7 @@ codegen(codegen_scope *s, node *tree, int val)
       mrb_value str;
       int sym;
 
-      str = mrb_format(mrb, "$%S", mrb_fixnum_value(nint(tree)));
+      str = mrb_format(mrb, "$%d", nint(tree));
       sym = new_sym(s, mrb_intern_str(mrb, str));
       genop_2(s, OP_GETGV, cursp(), sym);
       push();
@@ -2942,7 +2963,11 @@ scope_new(mrb_state *mrb, codegen_scope *prev, node *lv)
   mrb_pool *pool = mrb_pool_open(mrb);
   codegen_scope *p = (codegen_scope *)mrb_pool_alloc(pool, sizeof(codegen_scope));
 
-  if (!p) return NULL;
+  if (!p) {
+    if (prev)
+      codegen_error(prev, "unexpected scope");
+    return NULL;
+  }
   *p = codegen_scope_zero;
   p->mrb = mrb;
   p->mpool = pool;
@@ -2990,15 +3015,15 @@ scope_new(mrb_state *mrb, codegen_scope *prev, node *lv)
   }
   p->ai = mrb_gc_arena_save(mrb);
 
-  p->filename = prev->filename;
-  if (p->filename) {
+  p->filename_sym = prev->filename_sym;
+  if (p->filename_sym) {
     p->lines = (uint16_t*)mrb_malloc(mrb, sizeof(short)*p->icapa);
   }
   p->lineno = prev->lineno;
 
   /* debug setting */
   p->debug_start_pos = 0;
-  if (p->filename) {
+  if (p->filename_sym) {
     mrb_debug_info_alloc(mrb, p->irep);
   }
   else {
@@ -3018,6 +3043,9 @@ scope_finish(codegen_scope *s)
   mrb_state *mrb = s->mrb;
   mrb_irep *irep = s->irep;
 
+  if (s->nlocals >= 0x3ff) {
+    codegen_error(s, "too many local variables");
+  }
   irep->flags = 0;
   if (s->iseq) {
     irep->iseq = (mrb_code *)codegen_realloc(s, s->iseq, sizeof(mrb_code)*s->pc);
@@ -3026,8 +3054,9 @@ scope_finish(codegen_scope *s)
   irep->pool = (mrb_value*)codegen_realloc(s, irep->pool, sizeof(mrb_value)*irep->plen);
   irep->syms = (mrb_sym*)codegen_realloc(s, irep->syms, sizeof(mrb_sym)*irep->slen);
   irep->reps = (mrb_irep**)codegen_realloc(s, irep->reps, sizeof(mrb_irep*)*irep->rlen);
-  if (s->filename) {
-    const char *filename = mrb_parser_get_filename(s->parser, s->filename_index);
+  if (s->filename_sym) {
+    mrb_sym fname = mrb_parser_get_filename(s->parser, s->filename_index);
+    const char *filename = mrb_sym_name_len(s->mrb, fname, NULL);
 
     mrb_debug_info_append_file(s->mrb, s->irep->debug_info,
                                filename, s->lines, s->debug_start_pos, s->pc);
@@ -3131,12 +3160,9 @@ generate_code(mrb_state *mrb, parser_state *p, int val)
   struct RProc *proc;
   struct mrb_jmpbuf *prev_jmp = mrb->jmp;
 
-  if (!scope) {
-    return NULL;
-  }
   scope->mrb = mrb;
   scope->parser = p;
-  scope->filename = p->filename;
+  scope->filename_sym = p->filename_sym;
   scope->filename_index = p->current_filename_index;
 
   MRB_TRY(&scope->jmp) {
